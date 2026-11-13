@@ -1,0 +1,23 @@
+services:
+  drill-api:
+    build: .
+    image: drill-csv-api:latest
+    container_name: drill-csv-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_ROOT: /data
+      BATCH_TIMEOUT_SECONDS: "10"
+      MAX_UPLOAD_BYTES: "2097152"
+    volumes:
+      - drill-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  drill-data:
