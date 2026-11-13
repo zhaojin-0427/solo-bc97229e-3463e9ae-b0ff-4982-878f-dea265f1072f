@@ -11,7 +11,11 @@
   3) 输出文件通过完整校验；
   才把批次从 running 原子翻转为 succeeded（可下载）。
   父进程先退出、子进程仍在写文件时不会提前发布。
-* 终态写入前先清理残件（非成功批次删除 output.csv 与 work 目录）。
+* 执行管控不依赖数据库可写：另一连接持续持有 SQLite 写锁时，
+  到期批次仍按超时上限整组终止、残件立即清除；终态登记进入持久队列，
+  由登记线程自动重试，解锁后接续落库（超时→timeout、失败→failed、
+  校验通过→succeeded）。已发布结果不回退、脚本不重跑、
+  未发布批次不提供残件下载。
 """
 
 from __future__ import annotations
@@ -111,6 +115,45 @@ def _cleanup_remnants(batch_dir: Path) -> None:
         pass
 
 
+def _on_terminal_applied(
+    batch_id: str, batch_dir: Path, status: str, rowcount: int
+) -> None:
+    """终态登记落库后的回调（在登记线程中执行）。
+
+    rowcount == 0 表示条件更新未命中：取消已先受理（或行已处其它终态）。
+    此时绝不覆盖既有终态；若发布输给了取消，清除输出残件并为 cancelled
+    批次补写终态字段，保证取消批次字段完整、不可下载。
+    """
+    if rowcount:
+        _log_runner(batch_dir, f"批次终态={status} 已落库")
+        return
+    try:
+        row = db.query_one(
+            "SELECT status, finished_at FROM batches WHERE id = ?", (batch_id,)
+        )
+    except Exception:
+        return
+    if row is None:
+        return
+    if row["status"] == config.STATUS_CANCELLED:
+        _cleanup_remnants(batch_dir)  # 发布未生效：输出残件不得留存
+        if row["finished_at"] is None:
+            db.execute_durable(
+                """
+                UPDATE batches
+                   SET finished_at = ?, detail = ?
+                 WHERE id = ? AND status = ? AND finished_at IS NULL
+                """,
+                (
+                    db.utcnow(),
+                    "取消先于发布受理，批次不发布，残件已清除",
+                    batch_id,
+                    config.STATUS_CANCELLED,
+                ),
+            )
+        _log_runner(batch_dir, "取消先于发布生效，终态登记未覆盖 cancelled")
+
+
 def _finish(
     batch_id: str,
     status: str,
@@ -122,15 +165,17 @@ def _finish(
     batch_dir: Path,
     expect_status: str = config.STATUS_RUNNING,
 ) -> None:
-    """原子翻转终态；仅成功且 keep_output 时保留输出文件，否则清理残件。
+    """登记终态：残件立即清理（不等数据库），状态翻转进入持久登记队列。
 
-    expect_status 用于取消分支：取消接口已先把状态翻为 cancelled，
-    执行器终止进程后以 cancelled 为前置条件补写终态字段。
+    条件 UPDATE（WHERE status = expect_status）在真正落库时才求值，
+    因此与取消接口的互斥语义与同步写入完全一致：谁先提交谁生效。
+    登记遇写锁由后台线程自动重试，解锁后接续落库，本线程即刻返回。
+    finished_at 取决策完成时刻（而非落库时刻），如实记录执行结束时间。
     """
     if not keep_output:
         _cleanup_remnants(batch_dir)
     output_path = str(batch_dir / config.OUTPUT_CSV_NAME) if keep_output else None
-    db.execute(
+    db.execute_durable(
         """
         UPDATE batches
            SET status = ?, finished_at = ?, exit_code = ?,
@@ -147,29 +192,13 @@ def _finish(
             batch_id,
             expect_status,
         ),
-    )
-    _log_runner(batch_dir, f"批次终态={status} detail={detail[:200]!r}")
-
-
-def _backfill_terminal_fields(batch_id: str, batch_dir: Path, detail: str) -> None:
-    """竞态兜底：取消已先生效时，补写 finished_at/detail，状态保持 cancelled。
-
-    仅更新仍处于 cancelled 且 finished_at 为空的行，绝不覆盖终态状态。
-    """
-    db.execute(
-        """
-        UPDATE batches
-           SET finished_at = ?, detail = ?
-         WHERE id = ? AND status = ? AND finished_at IS NULL
-        """,
-        (
-            db.utcnow(),
-            detail[: config.MAX_DETAIL_CHARS],
-            batch_id,
-            config.STATUS_CANCELLED,
+        on_applied=lambda rowcount: _on_terminal_applied(
+            batch_id, batch_dir, status, rowcount
         ),
     )
-    _log_runner(batch_dir, f"取消先生效，补写终态字段: {detail[:200]!r}")
+    _log_runner(
+        batch_dir, f"批次终态={status} 登记已受理（等待落库） detail={detail[:200]!r}"
+    )
 
 
 def run_batch(batch_id: str, expected_hole_ids: list[str]) -> None:
@@ -224,12 +253,18 @@ def run_batch(batch_id: str, expected_hole_ids: list[str]) -> None:
 
     pgid = proc.pid
     orphan_deadline: Optional[float] = None
-    timed_out = False
+    registered = False  # 是否已提交终态登记（提交后线程即可安全退出）
 
     try:
         while True:
-            # 取消 / 超时检查（状态由 API 线程翻转或时间到达）
-            current = db.query_one("SELECT status FROM batches WHERE id = ?", (batch_id,))
+            # 取消检查：走独立只读连接，外部写锁不会阻塞；即便如此仍按
+            # 尽力而为处理——读库异常绝不拖延下面的超时执法。
+            try:
+                current = db.query_one(
+                    "SELECT status FROM batches WHERE id = ?", (batch_id,)
+                )
+            except Exception:
+                current = None
             if current is not None and current["status"] == config.STATUS_CANCELLED:
                 _kill_group(pgid, batch_dir, "收到取消", proc)
                 _finish(
@@ -242,9 +277,10 @@ def run_batch(batch_id: str, expected_hole_ids: list[str]) -> None:
                     batch_dir=batch_dir,
                     expect_status=config.STATUS_CANCELLED,
                 )
+                registered = True
                 return
+            # 超时检查：只依赖单调时钟，与数据库是否可写无关
             if time.monotonic() >= deadline:
-                timed_out = True
                 _kill_group(pgid, batch_dir, "执行超时", proc)
                 _finish(
                     batch_id,
@@ -258,6 +294,7 @@ def run_batch(batch_id: str, expected_hole_ids: list[str]) -> None:
                     keep_output=False,
                     batch_dir=batch_dir,
                 )
+                registered = True
                 return
 
             ret = proc.poll()
@@ -286,11 +323,13 @@ def run_batch(batch_id: str, expected_hole_ids: list[str]) -> None:
                             keep_output=False,
                             batch_dir=batch_dir,
                         )
+                        registered = True
                         return
                     time.sleep(_POLL_INTERVAL)
                     continue
                 # 整组退出，进入退出码 + 输出校验
                 _evaluate(batch_id, ret, expected_hole_ids, batch_dir, output_path)
+                registered = True
                 return
 
             time.sleep(_POLL_INTERVAL)
@@ -298,32 +337,26 @@ def run_batch(batch_id: str, expected_hole_ids: list[str]) -> None:
         stdout_log.close()
         stderr_log.close()
         # 任何意外路径下都不允许留下存活进程组
-        if proc.poll() is None or _group_pids(pgid):
-            _kill_group(pgid, batch_dir, "执行器收尾", proc)
-        row = db.query_one(
-            "SELECT status, finished_at FROM batches WHERE id = ?", (batch_id,)
-        )
-        if row is not None and row["status"] == config.STATUS_CANCELLED:
-            # 取消在评估窗口内抢先生效：保证终态字段完整，状态维持 cancelled
-            if row["finished_at"] is None:
+        try:
+            if proc.poll() is None or _group_pids(pgid):
+                _kill_group(pgid, batch_dir, "执行器收尾", proc)
+        except Exception:
+            pass
+        if not registered:
+            # 不应到达的异常路径：保守判失败，绝不发布；登记同样走持久队列
+            try:
                 _cleanup_remnants(batch_dir)
-                _backfill_terminal_fields(
-                    batch_id, batch_dir, "取消先于发布受理，批次不发布，残件已清除"
+                _finish(
+                    batch_id,
+                    config.STATUS_FAILED,
+                    exit_code=proc.returncode,
+                    output_rows=None,
+                    detail="执行器异常收尾，未完成发布判定",
+                    keep_output=False,
+                    batch_dir=batch_dir,
                 )
-        elif row is not None and row["status"] == config.STATUS_RUNNING:
-            # 不应到达的异常路径：保守判失败，绝不发布
-            _cleanup_remnants(batch_dir)
-            _finish(
-                batch_id,
-                config.STATUS_FAILED,
-                exit_code=proc.returncode,
-                output_rows=None,
-                detail="执行器异常收尾，未完成发布判定",
-                keep_output=False,
-                batch_dir=batch_dir,
-            )
-        if timed_out:
-            pass  # 终态已写入
+            except Exception:
+                pass
 
 
 def _evaluate(

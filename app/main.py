@@ -2,10 +2,15 @@
 
 状态机：running ──► succeeded / failed / timeout / cancelled
 重启恢复：服务启动时所有遗留 running 批次标记为 interrupted，不可下载。
+
+写锁韧性：另一连接持续持有 SQLite 写锁时，查询接口照常读取已提交状态；
+写接口（建批、取消）在有限预算内重试后返回 503，绝不长时间悬挂；
+批次终态登记由后台线程自动接续，解锁后落库，已发布结果不回退。
 """
 
 from __future__ import annotations
 
+import shutil
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -51,31 +56,46 @@ def _to_out(row: dict) -> BatchOut:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.connect()
-    # 重启恢复：上次未跑完的批次一律标 interrupted，不可下载
-    cur = db.execute(
+    # 重启恢复：上次未跑完的批次一律标 interrupted，不可下载。
+    # started_at 守卫确保只翻转本次启动前已存在的批次，绝不误伤启动后
+    # 新建的 running 批次；若写锁被其它连接占用，有限重试后转为持久登记，
+    # 解锁后自动补应用。
+    startup_ts = db.utcnow()
+    recovery_sql = (
         "UPDATE batches SET status = ?, finished_at = ?, detail = ? "
-        "WHERE status = ?",
-        (
-            config.STATUS_INTERRUPTED,
-            db.utcnow(),
-            "服务重启时批次仍在执行，标记为中断，结果不可下载",
-            config.STATUS_RUNNING,
-        ),
+        "WHERE status = ? AND (started_at IS NULL OR started_at < ?)"
     )
-    if cur.rowcount:
-        print(f"[startup] {cur.rowcount} 个未完成批次标记为 interrupted")
+    recovery_params = (
+        config.STATUS_INTERRUPTED,
+        db.utcnow(),
+        "服务重启时批次仍在执行，标记为中断，结果不可下载",
+        config.STATUS_RUNNING,
+        startup_ts,
+    )
+    try:
+        cur = db.execute(recovery_sql, recovery_params, busy_budget=10.0)
+        if cur.rowcount:
+            print(f"[startup] {cur.rowcount} 个未完成批次标记为 interrupted")
+    except db.DatabaseBusyError:
+        print("[startup] 警告：数据库写锁被其它连接占用，启动恢复转为后台接续")
+        db.execute_durable(recovery_sql, recovery_params)
     yield
-    # 优雅关闭：仍在跑的批次同样标记 interrupted（容器停止后进程组随之消失）
-    db.execute(
-        "UPDATE batches SET status = ?, finished_at = ?, detail = ? "
-        "WHERE status = ?",
-        (
-            config.STATUS_INTERRUPTED,
-            db.utcnow(),
-            "服务关闭时批次仍在执行，标记为中断，结果不可下载",
-            config.STATUS_RUNNING,
-        ),
-    )
+    # 优雅关闭：先把已受理的终态登记落库，再把仍在跑的批次标记 interrupted
+    # （容器停止后进程组随之消失）
+    db.flush_durable(timeout=5.0)
+    try:
+        db.execute(
+            "UPDATE batches SET status = ?, finished_at = ?, detail = ? "
+            "WHERE status = ?",
+            (
+                config.STATUS_INTERRUPTED,
+                db.utcnow(),
+                "服务关闭时批次仍在执行，标记为中断，结果不可下载",
+                config.STATUS_RUNNING,
+            ),
+        )
+    except db.DatabaseBusyError:
+        print("[shutdown] 警告：数据库写锁被占用，关闭恢复未能落库")
     db.close()
 
 
@@ -142,24 +162,29 @@ async def create_batch(
     script_path.write_text(script_text, encoding="utf-8")
 
     now = db.utcnow()
-    db.execute(
-        """
-        INSERT INTO batches (id, status, created_at, started_at, dir_path,
-                             input_path, script_path, work_dir, input_rows)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            batch_id,
-            config.STATUS_RUNNING,
-            now,
-            now,
-            str(batch_dir),
-            str(input_path),
-            str(script_path),
-            str(work_dir),
-            len(checked.rows),
-        ),
-    )
+    try:
+        db.execute(
+            """
+            INSERT INTO batches (id, status, created_at, started_at, dir_path,
+                                 input_path, script_path, work_dir, input_rows)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                batch_id,
+                config.STATUS_RUNNING,
+                now,
+                now,
+                str(batch_dir),
+                str(input_path),
+                str(script_path),
+                str(work_dir),
+                len(checked.rows),
+            ),
+        )
+    except db.DatabaseBusyError as exc:
+        # 写锁被其它连接持续占用：登记失败，清理已落盘的批次文件，不留残件
+        shutil.rmtree(batch_dir, ignore_errors=True)
+        raise HTTPException(503, f"{exc}，批次未受理，请稍后重试") from None
 
     thread = threading.Thread(
         target=runner.run_batch,
@@ -197,10 +222,14 @@ def cancel_batch(batch_id: str) -> BatchOut:
     if row is None:
         raise HTTPException(404, "批次不存在")
     # 条件更新：取消先受理则状态翻为 cancelled，执行器轮询到后终止整组进程
-    cur = db.execute(
-        "UPDATE batches SET status = ? WHERE id = ? AND status = ?",
-        (config.STATUS_CANCELLED, batch_id, config.STATUS_RUNNING),
-    )
+    try:
+        cur = db.execute(
+            "UPDATE batches SET status = ? WHERE id = ? AND status = ?",
+            (config.STATUS_CANCELLED, batch_id, config.STATUS_RUNNING),
+        )
+    except db.DatabaseBusyError as exc:
+        # 写锁被其它连接持续占用：取消未受理，批次状态未变
+        raise HTTPException(503, f"{exc}，取消未受理，请稍后重试") from None
     if cur.rowcount == 0:
         # 发布（succeeded）或其它终态先生效 → 拒绝取消
         raise HTTPException(
